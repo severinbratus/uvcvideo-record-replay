@@ -1938,6 +1938,8 @@ int uvc_register_video_device(struct uvc_device *dev,
 {
 	int ret;
 
+	pr_info("hello new uvc!");
+
 	/* Initialize the video buffers queue. */
 	ret = uvc_queue_init(queue, type, !uvc_no_drop_param);
 	if (ret)

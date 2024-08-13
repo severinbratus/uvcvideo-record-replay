@@ -231,6 +231,10 @@ static int uvc_v4l2_try_format(struct uvc_streaming *stream,
 		fcc[0], fcc[1], fcc[2], fcc[3],
 		fmt->fmt.pix.width, fmt->fmt.pix.height);
 
+	pr_info("uvc try format %c%c%c%c %ux%u",
+		fcc[0], fcc[1], fcc[2], fcc[3],
+		fmt->fmt.pix.width, fmt->fmt.pix.height);
+
 	/*
 	 * Check if the hardware supports the requested format, use the default
 	 * format otherwise.

@@ -20,6 +20,63 @@
 #include <media/v4l2-fh.h>
 #include <media/videobuf2-v4l2.h>
 
+// SB BEGIN
+
+#define _1MB 0x100000
+#define _hMB  0x80000
+
+#define TOTAL_NFRAMES_MAX 2000
+
+#define MODE_NORMAL 0
+#define MODE_RECORD 1
+#define MODE_REPLAY 2
+
+#define FMAT_MJPG 'M'
+#define FMAT_YUYV 'Y'
+
+#define N_SEGMS_MAX 20
+#define YUYV_FRAME_SIZE 614400
+#define MJPG_FRAME_SIZE_MAX _hMB
+
+#define SIZE_FDATA (TOTAL_NFRAMES_MAX * YUYV_FRAME_SIZE)
+#define SIZE_FSIZES (TOTAL_NFRAMES_MAX * sizeof(u32))
+
+/*
+ * Framestore stuff
+ * A segment is a sequnce of frames of the same format.
+ */
+
+struct framestore {
+	u8 cur_segm_idx;
+	// Current max frame size
+	u32 cur_frame_max;
+	
+	// Current frame sequence numbers per segment
+	u8 seqs[N_SEGMS_MAX];
+
+	u8 n_segms;
+
+	char segm_fmats[N_SEGMS_MAX];
+	u16 segm_nframes[N_SEGMS_MAX];
+
+	// `offsets_*` indicate where the values (frame data / sizes) for a particular segment begin
+	// in the corresponding arrays.
+	u32 offsets_fdata[N_SEGMS_MAX];
+	u16 offsets_fsizes[N_SEGMS_MAX];
+
+	// All frames are stored in one big buffer, which is exposed as a whole via debugfs
+	void* fdata;
+	// Actual frame sizes
+	u32* fsizes;
+};
+
+
+extern struct framestore fstore;
+extern u8 mode_switch;
+
+// SB END
+
+
 /* --------------------------------------------------------------------------
  * UVC constants
  */

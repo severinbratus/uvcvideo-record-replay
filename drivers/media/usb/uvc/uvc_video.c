@@ -24,6 +24,9 @@
 
 #include "uvcvideo.h"
 
+#define SEGM_IDX fstore.cur_segm_idx
+#define GET_FRAME_SIZE(SEGM, FRAME) (fstore.fsizes[fstore.offsets_fdata[SEGM] + FRAME])
+
 /* ------------------------------------------------------------------------
  * UVC Controls
  */
@@ -933,6 +936,7 @@ static void uvc_video_stats_update(struct uvc_streaming *stream)
 		frame->has_initial_pts ? "" : "!",
 		frame->nb_scr_diffs, frame->nb_scr,
 		frame->pts, frame->scr_stc, frame->scr_sof);
+	pr_info("stats_update: uvc frame %u of size %u", stream->sequence, frame->size);
 
 	stream->stats.stream.nb_frames++;
 	stream->stats.stream.nb_packets += stream->stats.frame.nb_packets;
@@ -1073,7 +1077,18 @@ static int uvc_video_decode_start(struct uvc_streaming *stream,
 	 * that discontinuous sequence numbers always indicate lost frames.
 	 */
 	if (stream->last_fid != fid) {
+		// Frame under index `sequence` requested.
+		// In REPLAY:
+		// the sequence must not >= the # frames stored.
+		// In RECORD: no expectations made.
+		if (mode_switch == MODE_REPLAY && stream->sequence >= fstore.segm_nframes[SEGM_IDX]) {
+			pr_emerg("uvc exc: more frames requested in REPLAY than stored: %d >= %d",
+				stream->sequence, fstore.segm_nframes[SEGM_IDX]);
+		}
 		stream->sequence++;
+		if (mode_switch == MODE_RECORD)
+			fstore.segm_nframes[SEGM_IDX]++;
+
 		if (stream->sequence)
 			uvc_video_stats_update(stream);
 	}
@@ -1190,8 +1205,27 @@ static void uvc_video_copy_data_work(struct work_struct *work)
 	for (i = 0; i < uvc_urb->async_operations; i++) {
 		struct uvc_copy_op *op = &uvc_urb->copy_operations[i];
 
+		if (mode_switch == MODE_NORMAL || mode_switch == MODE_RECORD) {
 		memcpy(op->dst, op->src, op->len);
+		}
 
+		// xxa: record a fragment of a frame
+		if (mode_switch == MODE_RECORD) {
+			int seq = op->buf->buf.sequence;
+			u32 offset = fstore.offsets_fdata[SEGM_IDX]
+						+ seq * fstore.cur_frame_max // current frame's location in the segment's buffer
+						+ (op->dst - op->buf->mem); // fragment's offset in the original operation
+			if (offset + op->len < SIZE_FDATA) {
+				memcpy(
+					fstore.fdata + offset,
+					op->src,
+					op->len
+				);
+				fstore.fsizes[fstore.offsets_fsizes[SEGM_IDX] + seq] += op->len;
+			} else {
+				pr_emerg("uvc exc: not enough buffer space in RECORD");
+			}
+		}
 		/* Release reference taken on this buffer. */
 		uvc_queue_buffer_release(op->buf);
 	}
@@ -1202,12 +1236,15 @@ static void uvc_video_copy_data_work(struct work_struct *work)
 			"Failed to resubmit video URB (%d).\n", ret);
 }
 
+// Here the driver fills in the async work ops that are later queued later in `uvc_video_complete`.
+// One copy op is added per call.
 static void uvc_video_decode_data(struct uvc_urb *uvc_urb,
 		struct uvc_buffer *buf, const u8 *data, int len)
 {
 	unsigned int active_op = uvc_urb->async_operations;
 	struct uvc_copy_op *op = &uvc_urb->copy_operations[active_op];
 	unsigned int maxlen;
+	int seq;
 
 	if (len <= 0)
 		return;
@@ -1220,7 +1257,24 @@ static void uvc_video_decode_data(struct uvc_urb *uvc_urb,
 	op->buf = buf;
 	op->src = data;
 	op->dst = buf->mem + buf->bytesused;
+
+	// xxc: add a fragment for later async cpy
+	if (mode_switch == MODE_NORMAL || mode_switch == MODE_RECORD) {
+
 	op->len = min_t(unsigned int, len, maxlen);
+
+	} else if (mode_switch == MODE_REPLAY) {
+		// int seq = op->buf->buf.sequence;
+		seq = fstore.seqs[SEGM_IDX];
+		// Copy as much as possible as soon as possible
+		len = min_t(unsigned int, 2028, GET_FRAME_SIZE(SEGM_IDX, seq) - buf->bytesused);
+		if (op->len <= 0)
+			return;
+		u32 offset = fstore.offsets_fdata[SEGM_IDX]
+					+ seq * fstore.cur_frame_max;
+		op->src = fstore.fdata + offset + buf->bytesused;
+		op->len = len;
+	}
 
 	buf->bytesused += op->len;
 
@@ -1243,6 +1297,16 @@ static void uvc_video_decode_end(struct uvc_streaming *stream,
 		uvc_dbg(stream->dev, FRAME, "Frame complete (EOF found)\n");
 		if (data[0] == len)
 			uvc_dbg(stream->dev, FRAME, "EOF in empty payload\n");
+
+		// xxb: frame complete
+		if (mode_switch == MODE_REPLAY) {
+			fstore.seqs[SEGM_IDX]++;
+			if (fstore.seqs[SEGM_IDX] >= fstore.segm_nframes[SEGM_IDX]) {
+				pr_emerg("decode_end: too many frames in REPLAY! cur_seg_idx = %d", SEGM_IDX);
+				fstore.seqs[SEGM_IDX] = fstore.segm_nframes[SEGM_IDX] - 1;
+			}
+		}
+
 		buf->state = UVC_BUF_STATE_READY;
 		if (stream->dev->quirks & UVC_QUIRK_STREAM_NO_FID)
 			stream->last_fid ^= UVC_STREAM_FID;
@@ -1411,6 +1475,7 @@ static void uvc_video_next_buffers(struct uvc_streaming *stream,
 	*video_buf = uvc_queue_next_buffer(&stream->queue, *video_buf);
 }
 
+// Decode one URB
 static void uvc_video_decode_isoc(struct uvc_urb *uvc_urb,
 			struct uvc_buffer *buf, struct uvc_buffer *meta_buf)
 {
@@ -1643,6 +1708,7 @@ static void uvc_video_complete(struct urb *urb)
 		return;
 	}
 
+	// Here the work prepared in uvc_video_decode_data_work
 	queue_work(stream->async_wq, &uvc_urb->work);
 }
 
@@ -2216,9 +2282,48 @@ int uvc_video_init(struct uvc_streaming *stream)
 	return 0;
 }
 
+
+void assert_format(struct uvc_streaming *stream) {
+	char fmat_expected = fstore.segm_fmats[SEGM_IDX];
+	u16 w_expected = fmat_expected == FMAT_YUYV ? 640 : 1280;
+	u16 w_actual = stream->cur_frame->wWidth;
+	if (w_actual != w_expected) {
+		pr_emerg("uvc exc: wrong format: w_actual = %d, w_expected = %d (%c)",
+			w_expected, w_actual, fmat_expected);
+	}
+}
+
+
+char get_cur_fmat(struct uvc_streaming *stream) {
+	u16 w = stream->cur_frame->wWidth;
+	return w == 640 ? FMAT_YUYV : FMAT_MJPG;
+}
+
+
 int uvc_video_start_streaming(struct uvc_streaming *stream)
 {
 	int ret;
+	pr_info("start_streaming. segment index = %d", SEGM_IDX);
+
+	// xxd: segment begins
+	if (mode_switch == MODE_RECORD) {
+		// Record segment params
+		fstore.segm_fmats[SEGM_IDX] = get_cur_fmat(stream);
+	} else if (mode_switch == MODE_REPLAY) {
+		// Variant 1: Check if segment params match the expectation.
+		// if (SEG_IDX >= fstore.n_segs) {
+			// pr_emerg("uvc exc: too many segments requested in REPLAY: %d >= %d",
+				// SEG_IDX, fstore.n_segs);
+		// }
+		// assert_format(stream);
+
+		// Variant 2: Instead of asserting on format, match by it!
+		// Here, only two stored segments are used: YUYV, and MJPG.
+		char cur_fmat = get_cur_fmat(stream);
+		SEGM_IDX = (cur_fmat == 'Y') ? 0 : 1;
+	}
+	// Helper var to compute offsets
+	fstore.cur_frame_max = fstore.segm_fmats[SEGM_IDX] == FMAT_YUYV ? YUYV_FRAME_SIZE : MJPG_FRAME_SIZE_MAX;
 
 	ret = uvc_video_clock_init(stream);
 	if (ret < 0)
@@ -2267,4 +2372,18 @@ void uvc_video_stop_streaming(struct uvc_streaming *stream)
 	}
 
 	uvc_video_clock_cleanup(stream);
+	if (mode_switch == MODE_RECORD || mode_switch == MODE_REPLAY)
+		SEGM_IDX++;
+	if (mode_switch == MODE_RECORD) {
+		fstore.n_segms++;	
+		// HACK: decrement #frames by one, since it is otherwise too many?
+		fstore.segm_nframes[SEGM_IDX-1]--;
+		// Define the offsets for the new segment
+		fstore.offsets_fdata[SEGM_IDX] = fstore.offsets_fdata[SEGM_IDX-1]
+			+ fstore.segm_nframes[SEGM_IDX-1] * fstore.cur_frame_max;
+		fstore.offsets_fsizes[SEGM_IDX] = fstore.offsets_fsizes[SEGM_IDX-1]
+			+ fstore.segm_nframes[SEGM_IDX-1];
+	}
+
+	// SEG_IDX = SEG_IDX % N_SEGMENTS_EXPECTED;
 }

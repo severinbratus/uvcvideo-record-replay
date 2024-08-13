@@ -13,6 +13,27 @@
 
 #include "uvcvideo.h"
 
+#define N_BLOBS_MAX 32
+
+#define LAST_BLOB_WRAP (blob_wraps[n_blobs-1])
+
+#define ADD_FSTORE_BLOB_FILE_AS_ARR(KEY) { \
+    blob_wraps[n_blobs].data = (void *)(&fstore.KEY); \
+    blob_wraps[n_blobs].size = sizeof(fstore.KEY); \
+    n_blobs++; \
+	debugfs_create_blob(#KEY, 0644, fstore_dir, &LAST_BLOB_WRAP); \
+}
+
+#define ADD_FSTORE_BLOB_FILE_AS_PTR(KEY, SIZE) { \
+    blob_wraps[n_blobs].data = (void *)(fstore.KEY); \
+    blob_wraps[n_blobs].size = SIZE; \
+    n_blobs++; \
+	debugfs_create_blob(#KEY, 0644, fstore_dir, &LAST_BLOB_WRAP); \
+}
+
+
+struct framestore fstore = {};
+
 /* -----------------------------------------------------------------------------
  * Statistics
  */
@@ -69,6 +90,7 @@ static const struct file_operations uvc_debugfs_stats_fops = {
  */
 
 static struct dentry *uvc_debugfs_root_dir;
+static struct dentry *sb_dir;
 
 void uvc_debugfs_init_stream(struct uvc_streaming *stream)
 {
@@ -94,12 +116,48 @@ void uvc_debugfs_cleanup_stream(struct uvc_streaming *stream)
 	stream->debugfs_dir = NULL;
 }
 
+/* Init & cleanup */
+
+struct debugfs_blob_wrapper blob_wraps[N_BLOBS_MAX];
+u8 n_blobs = 0;
+
+u8 mode_switch = MODE_NORMAL;
+
 void uvc_debugfs_init(void)
 {
 	uvc_debugfs_root_dir = debugfs_create_dir("uvcvideo", usb_debug_root);
+
+	sb_dir = debugfs_create_dir("sb", uvc_debugfs_root_dir);
+	if (sb_dir == NULL) {
+		pr_emerg("uvc exc: no sb_dir!");
+		return;
+	}
+
+	struct dentry* fstore_dir = debugfs_create_dir("framestore", sb_dir);
+
+	debugfs_create_u8("n_segms", 0644, fstore_dir, &fstore.n_segms);
+
+	// Each of these takes 20 * u32 at most
+
+	ADD_FSTORE_BLOB_FILE_AS_ARR(segm_fmats);
+	ADD_FSTORE_BLOB_FILE_AS_ARR(segm_nframes);
+	ADD_FSTORE_BLOB_FILE_AS_ARR(offsets_fdata);
+	ADD_FSTORE_BLOB_FILE_AS_ARR(offsets_fsizes);
+
+	fstore.fdata = vmalloc(SIZE_FDATA);
+	fstore.fsizes = (u32*)kzalloc(SIZE_FSIZES, GFP_KERNEL);
+
+	ADD_FSTORE_BLOB_FILE_AS_PTR(fdata, SIZE_FDATA);
+	ADD_FSTORE_BLOB_FILE_AS_PTR(fsizes, SIZE_FSIZES);
+
+	debugfs_create_u8("index", 0644, sb_dir, &fstore.cur_segm_idx);
+	debugfs_create_u8("switch", 0644, sb_dir, &mode_switch);
 }
 
 void uvc_debugfs_cleanup(void)
 {
 	debugfs_remove_recursive(uvc_debugfs_root_dir);
+
+	vfree(fstore.fdata);
+	kfree(fstore.fsizes);
 }
