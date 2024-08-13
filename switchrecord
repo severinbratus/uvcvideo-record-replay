@@ -1,0 +1,4 @@
+echo Resetting segment index
+echo 0 | sudo tee /sys/kernel/debug/usb/uvcvideo/sb/index
+echo Switching to RECORD 1
+echo 1 | sudo tee /sys/kernel/debug/usb/uvcvideo/sb/switch
