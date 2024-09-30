@@ -1,6 +1,9 @@
 # Linux USB Video Class (UVC) Driver with RECORD & REPLAY modes
 
-Done as a proof of concept for spoofing face verification software and the like.
+A proof of concept for spoofing face verification software and the like.
+
+This repository contains modifications to the Linux (6.9.5) `uvcvideo` driver, with the modified files residing in the `drivers/media/usb/uvc` directory.
+It also contains scripts in Python & Bash for the spoofing workflow.
 
 # Example Usage
 
